@@ -1,1 +1,10 @@
 .env
+# Virtual environment created by uv
+.venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Local environment variables / secrets
+.env
