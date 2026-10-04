@@ -1,72 +1,120 @@
-from fastapi import FastAPI, HTTPException
-
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends
+from src.db import Post, get_async_session, create_db_and_tables
 from src.schemas import PostCreate
 
-app = FastAPI()
 
-text_posts = {
-    1: {
-        "title": "Getting Started with FastAPI",
-        "content": "FastAPI makes building high-performance Python REST APIs quick and intuitive."
-    },
-    2: {
-        "title": "Why Virtual Environments Matter",
-        "content": "Isolated environments prevent package dependency conflicts across your projects."
-    },
-    3: {
-        "title": "Understanding HTTP Methods",
-        "content": "GET retrieves data, POST submits data, and PUT updates existing resources."
-    },
-    4: {
-        "title": "Mastering Git Basics",
-        "content": "Commit early and push often to keep track of your code history safely."
-    },
-    5: {
-        "title": "Introduction to Pydantic",
-        "content": "Pydantic ensures data validation and settings management using standard Python types."
-    },
-    6: {
-        "title": "Asynchronous Python Explained",
-        "content": "Asyncio allows Python programs to handle multiple task executions concurrently."
-    },
-    7: {
-        "title": "Building RESTful APIs",
-        "content": "Design clear endpoints with standard status codes to build intuitive web APIs."
-    },
-    8: {
-        "title": "Database Indexing Tips",
-        "content": "Indexes speed up query read operations but add slight overhead to database writes."
-    },
-    9: {
-        "title": "Writing Clean Code",
-        "content": "Clear variable naming and short functions make your codebase easy to maintain."
-    },
-    10: {
-        "title": "Deploying Python Apps",
-        "content": "Containerize your app with Docker for seamless and consistent cloud deployments."
-    }
-}
+from sqlalchemy.ext.asyncio import AsyncSession
+from contextlib import asynccontextmanager
 
-@app.get("/posts")
-def get_all_posts(limit: int = None):
-    if limit:
-        return list(text_posts.values())[:limit]
-    return text_posts
+from sqlalchemy import select
+from src.images import imagekit
+from imagekitio.models.UploadFileRequestOptions import UploadFileRequestOptions
+
+import shutil
+import os
+import uuid
+import tempfile
 
 
-@app.get("/posts/{id}")
-def get_post(id: int):
-    if id not in text_posts:
-        raise HTTPException(status_code=404, detail="Post not found")
-    return text_posts[id]
+
+
+
+@asynccontextmanager 
+async def lifespan(app: FastAPI):
+    await create_db_and_tables()
+    yield
     
-    
-# post endpoint
+app = FastAPI(lifespan=lifespan)
 
-@app.post("/posts")
-def create_post(post: PostCreate) -> PostCreate:
-    new_post = {"title": post.title, "content": post.content}
-    text_posts[max(text_posts.keys()) + 1] = new_post
-    return new_post
+
+
+@app.post("/upload/")
+async def upload_file(
+    file: UploadFile = File(...),
+    caption: str = Form(...),
+    session: AsyncSession = Depends(get_async_session)
+):
+    temp_file = None
+    
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+            temp_file_path = temp_file.name
+            shutil.copyfileobj(file.file, temp_file)
+            
+        upload_result = imagekit.upload_file(
+            file=open(temp_file_path, "rb"),
+            file_name=file.filename,
+            options=UploadFileRequestOptions(
+                use_unique_file_name=True,
+                tags="backend-upload"
+            )
+        )
+        
+        if upload_result.response_metadata.http_status_code == 200:
+            post = Post(
+                caption=caption,
+                url=upload_result.url,
+                file_type="video" if file.content_type.startswith("video/") else "image",
+                file_name=upload_result.name
+            )
+                
+            session.add(post)
+            await session.commit()
+            await session.refresh(post)
+            return post 
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
+        
+        file.file.close()
+
+
+## feed-------------------
+@app.get("/feed")
+async def get_feed(
+    session: AsyncSession = Depends(get_async_session)
+    
+    ):
+    result = await session.execute(select(Post).order_by(Post.created_at.desc()))
+    posts = [row[0] for row in result.all()]
+    
+    posts_data = []
+    for post in posts:
+        posts_data.append(
+            {
+                "id": str(post.id),
+                "caption": post.caption,
+                "url": post.url,
+                "file_type": post.file_type,
+                "file_name": post.file_name,
+                "created_at": post.created_at.isoformat(),
+            }
+      )
+    
+    return posts_data
+        
+
+@app.delete("/delete/{post_id}")
+async def delete_post(post_id: str, session: AsyncSession = Depends(get_async_session)):                  
+    try:
+        post_uuid = uuid.UUID(post_id)
+        result = await session.execute(select(Post).where(Post.id == post_uuid))
+        
+        post = result.scalars().first()
+        
+        if not post:
+            raise HTTPException(status_code=404, detail="Post not found")
+        
+        await session.delete(post)
+        await session.commit()
+        
+        return {"success": True, "message": "Post deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    
 
 
